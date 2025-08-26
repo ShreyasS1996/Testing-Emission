@@ -1,3 +1,5 @@
+import io
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -49,10 +51,56 @@ PERF_METRICS = [
 
 REQUIRED_KEYS = ["BatchNumber", "EngineModel", "EngineNo"]  # required for filtering
 
+# ---------- Robust file loader ----------
+def load_table(uploaded_file) -> pd.DataFrame:
+    """
+    Load CSV or Excel robustly with good error messages.
+    - Supports .csv, .xlsx, .xls
+    - Tries delimiter inference and encoding fallbacks for CSV
+    - Raises Streamlit-friendly errors when file is empty or malformed
+    """
+    if uploaded_file is None:
+        return pd.DataFrame()
+
+    # Read raw bytes once
+    raw = uploaded_file.read()
+    # IMPORTANT: reset pointer so pandas can read from the start again
+    uploaded_file.seek(0)
+
+    if raw is None or len(raw) == 0:
+        st.error("Uploaded file is empty (0 bytes). Please upload a valid CSV/XLSX file.")
+        st.stop()
+
+    name = getattr(uploaded_file, "name", "") or ""
+    lower_name = name.lower()
+
+    try:
+        if lower_name.endswith(".xlsx") or lower_name.endswith(".xls"):
+            # Excel path
+            return pd.read_excel(uploaded_file, engine="openpyxl")
+        else:
+            # CSV path (try UTF-8 with delimiter inference)
+            try:
+                df = pd.read_csv(uploaded_file, sep=None, engine="python")
+                return df
+            except pd.errors.EmptyDataError:
+                st.error("The CSV appears to have no data rows. Check that the file has a header and data.")
+                st.stop()
+            except Exception:
+                # Retry with latin-1
+                uploaded_file.seek(0)
+                try:
+                    df = pd.read_csv(uploaded_file, sep=None, engine="python", encoding="latin-1")
+                    return df
+                except pd.errors.EmptyDataError:
+                    st.error("The CSV appears to have no data rows (even after retry).")
+                    st.stop()
+    finally:
+        # always rewind for any subsequent reads
+        uploaded_file.seek(0)
 
 def _normalize(s: str) -> str:
     return s.strip().lower().replace("-", "_").replace(" ", "_").replace("/", "_")
-
 
 def suggest_column_mapping(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     """Auto-suggest mapping from EXPECTED_MAP to df columns (case/space tolerant)."""
@@ -75,21 +123,18 @@ def suggest_column_mapping(df: pd.DataFrame) -> Dict[str, Optional[str]]:
                 break
     return mapping
 
-
 def apply_mapping(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.DataFrame:
     """Rename mapped columns to canonical names."""
     rename_dict = {v: k for k, v in mapping.items() if v is not None and v in df.columns}
     return df.rename(columns=rename_dict)
 
-
 def missing_required(mapping: Dict[str, Optional[str]], keys: List[str]) -> List[str]:
     return [k for k in keys if not mapping.get(k)]
-
 
 def agg_by_engine(df: pd.DataFrame, metric_cols: List[str], agg_fn: str) -> pd.DataFrame:
     """Aggregate to EngineNo level using chosen agg_fn for numeric metric_cols."""
     present = [m for m in metric_cols if m in df.columns]
-    if not present:
+    if not present or df.empty:
         return df.iloc[0:0].copy()
 
     # build aggregation map
@@ -111,7 +156,6 @@ def agg_by_engine(df: pd.DataFrame, metric_cols: List[str], agg_fn: str) -> pd.D
         grouped = grouped.merge(meta, on="EngineNo", how="left")
     return grouped
 
-
 def safe_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     """Coerce specified columns to numeric; non-convertible become NaN."""
     out = df.copy()
@@ -120,16 +164,18 @@ def safe_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
             out[c] = pd.to_numeric(out[c], errors="coerce")
     return out
 
-
 def pct_apply(series: pd.Series, pct: float) -> pd.Series:
     factor = 1.0 + pct / 100.0
     return pd.to_numeric(series, errors="coerce") * factor
-
 
 def plot_engine_grouped_bars(df: pd.DataFrame, y_orig: str, y_sim: Optional[str],
                              y_label: str, title: str):
     """Grouped bar (Original vs Simulated) if y_sim present; otherwise single series.
        Falls back to st.bar_chart when Plotly is unavailable."""
+    if df.empty or "EngineNo" not in df.columns or y_orig not in df.columns:
+        st.info("Nothing to plot for this selection.")
+        return
+
     data = df.sort_values("EngineNo").copy()
 
     if PLOTLY_OK:
@@ -157,18 +203,14 @@ def plot_engine_grouped_bars(df: pd.DataFrame, y_orig: str, y_sim: Optional[str]
             simple = data[["EngineNo", y_orig]].set_index("EngineNo")
             st.bar_chart(simple)
 
-
 # =========================
 # Sidebar (global)
 # =========================
 st.sidebar.title("Controls")
-st.sidebar.info("Upload CSVs, map columns, select a filter, and (optionally) apply simulations.")
+st.sidebar.info("Upload CSV/XLSX, map columns, select a filter, and (optionally) apply simulations.")
 
 if not PLOTLY_OK:
-    st.sidebar.error(
-        "Plotly is not available. Install it via requirements:\n\n"
-        "`plotly==5.23.0` to enable rich charts."
-    )
+    st.sidebar.error("Plotly is not available. Install `plotly==5.23.0` to enable rich charts.")
 
 agg_fn = st.sidebar.selectbox("Aggregation for batch/model charts", ["mean", "median", "max", "min"], index=0)
 sim_enabled = st.sidebar.toggle("Enable Simulations", value=True, help="Apply % changes and compare Original vs Simulated.")
@@ -183,14 +225,19 @@ tab_perf, tab_emis = st.tabs(["🔧 Engine Performance Testing", "🌫️ Emissi
 # =========================
 with tab_perf:
     st.subheader("Data Upload")
-    perf_file = st.file_uploader("Upload Performance CSV", type=["csv"], key="perf_csv")
+    perf_file = st.file_uploader("Upload Performance file (CSV/XLSX)", type=["csv", "xlsx", "xls"], key="perf_csv")
 
     if perf_file is not None:
-        # Read CSV with fallback encoding
-        try:
-            perf_df_raw = pd.read_csv(perf_file)
-        except Exception:
-            perf_df_raw = pd.read_csv(perf_file, encoding="latin-1")
+        # Read table robustly
+        perf_df_raw = load_table(perf_file)
+
+        # Remove fully empty columns/rows if any
+        perf_df_raw = perf_df_raw.dropna(axis=1, how="all")
+        perf_df_raw = perf_df_raw.dropna(axis=0, how="all")
+
+        if perf_df_raw.empty:
+            st.error("The uploaded Performance file has no usable data after removing empty rows/columns.")
+            st.stop()
 
         st.caption(f"Loaded {perf_df_raw.shape[0]} rows × {perf_df_raw.shape[1]} columns.")
 
@@ -233,18 +280,27 @@ with tab_perf:
 
         if filter_type == "Batch Number":
             values = sorted(filtered_df["BatchNumber"].dropna().unique().tolist())
+            if not values:
+                st.error("No batch values found in the data after mapping.")
+                st.stop()
             chosen = st.selectbox("Select batch", values)
             filtered_df = filtered_df[filtered_df["BatchNumber"] == chosen]
             st.success(f"Showing batch: {chosen}")
 
         elif filter_type == "Engine Model":
             values = sorted(filtered_df["EngineModel"].dropna().unique().tolist())
+            if not values:
+                st.error("No engine model values found in the data after mapping.")
+                st.stop()
             chosen = st.selectbox("Select engine model", values)
             filtered_df = filtered_df[filtered_df["EngineModel"] == chosen]
             st.success(f"Showing engine model: {chosen}")
 
         else:
             values = sorted(filtered_df["EngineNo"].dropna().unique().tolist())
+            if not values:
+                st.error("No engine numbers found in the data after mapping.")
+                st.stop()
             chosen = st.selectbox("Select engine number", values)
             filtered_df = filtered_df[filtered_df["EngineNo"] == chosen]
             st.success(f"Showing engine no.: {chosen}")
@@ -355,7 +411,7 @@ with tab_perf:
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.warning("Plotly is not installed; showing simplified chart.")
-                simple = merged.set_index("MetricLabel")[["Original"] + ([ "Simulated"] if "Simulated" in merged.columns else [])]
+                simple = merged.set_index("MetricLabel")[["Original"] + (["Simulated"] if "Simulated" in merged.columns else [])]
                 st.bar_chart(simple)
 
             # Export filtered rows (raw vs simulated)
@@ -369,22 +425,23 @@ with tab_perf:
 
             with st.expander("Show raw records for selected engine"):
                 st.dataframe(eng_df, use_container_width=True)
-
     else:
-        st.info("Upload a CSV to begin with Engine Performance.")
+        st.info("Upload a CSV/XLSX to begin with Engine Performance.")
 
 # =========================
 # EMISSION TAB
 # =========================
 with tab_emis:
     st.subheader("Data Upload")
-    emis_file = st.file_uploader("Upload Emission CSV", type=["csv"], key="emis_csv")
+    emis_file = st.file_uploader("Upload Emission file (CSV/XLSX)", type=["csv", "xlsx", "xls"], key="emis_csv")
 
     if emis_file is not None:
-        try:
-            emis_df_raw = pd.read_csv(emis_file)
-        except Exception:
-            emis_df_raw = pd.read_csv(emis_file, encoding="latin-1")
+        emis_df_raw = load_table(emis_file)
+        emis_df_raw = emis_df_raw.dropna(axis=1, how="all").dropna(axis=0, how="all")
+
+        if emis_df_raw.empty:
+            st.error("The uploaded Emission file has no usable data after removing empty rows/columns.")
+            st.stop()
 
         st.caption(f"Loaded {emis_df_raw.shape[0]} rows × {emis_df_raw.shape[1]} columns.")
 
@@ -423,18 +480,27 @@ with tab_emis:
 
         if filter_type_e == "Batch Number":
             values = sorted(emis_filtered["BatchNumber"].dropna().unique().tolist())
+            if not values:
+                st.error("No batch values found in the Emission data after mapping.")
+                st.stop()
             chosen_e = st.selectbox("Select batch", values, key="emis_batch")
             emis_filtered = emis_filtered[emis_filtered["BatchNumber"] == chosen_e]
             st.success(f"Showing batch: {chosen_e}")
 
         elif filter_type_e == "Engine Model":
             values = sorted(emis_filtered["EngineModel"].dropna().unique().tolist())
+            if not values:
+                st.error("No engine model values found in the Emission data after mapping.")
+                st.stop()
             chosen_e = st.selectbox("Select engine model", values, key="emis_model")
             emis_filtered = emis_filtered[emis_filtered["EngineModel"] == chosen_e]
             st.success(f"Showing engine model: {chosen_e}")
 
         else:
             values = sorted(emis_filtered["EngineNo"].dropna().unique().tolist())
+            if not values:
+                st.error("No engine numbers found in the Emission data after mapping.")
+                st.stop()
             chosen_e = st.selectbox("Select engine number", values, key="emis_engine")
             emis_filtered = emis_filtered[emis_filtered["EngineNo"] == chosen_e]
             st.success(f"Showing engine no.: {chosen_e}")
@@ -558,9 +624,8 @@ with tab_emis:
 
                 with st.expander("Show raw records for selected engine"):
                     st.dataframe(df_eng, use_container_width=True)
-
     else:
-        st.info("Upload a CSV to begin with Emission Testing.")
+        st.info("Upload a CSV/XLSX to begin with Emission Testing.")
 
 # Footer
 st.caption(
