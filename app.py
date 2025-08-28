@@ -1,5 +1,3 @@
-import io
-import os
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,10 +8,14 @@ from typing import Dict, List, Optional
 # -----------------------------
 try:
     import plotly.express as px
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
     PLOTLY_OK = True
     PLOTLY_IMPORT_ERROR = None
 except Exception as _e:
     px = None
+    go = None
+    make_subplots = None
     PLOTLY_OK = False
     PLOTLY_IMPORT_ERROR = _e
 
@@ -62,12 +64,10 @@ def load_table(uploaded_file) -> pd.DataFrame:
     if uploaded_file is None:
         return pd.DataFrame()
 
-    # Read raw bytes once
     raw = uploaded_file.read()
-    # IMPORTANT: reset pointer so pandas can read from the start again
     uploaded_file.seek(0)
 
-    if raw is None or len(raw) == 0:
+    if not raw:
         st.error("Uploaded file is empty (0 bytes). Please upload a valid CSV/XLSX file.")
         st.stop()
 
@@ -76,10 +76,8 @@ def load_table(uploaded_file) -> pd.DataFrame:
 
     try:
         if lower_name.endswith(".xlsx") or lower_name.endswith(".xls"):
-            # Excel path
             return pd.read_excel(uploaded_file, engine="openpyxl")
         else:
-            # CSV path (try UTF-8 with delimiter inference)
             try:
                 df = pd.read_csv(uploaded_file, sep=None, engine="python")
                 return df
@@ -87,7 +85,6 @@ def load_table(uploaded_file) -> pd.DataFrame:
                 st.error("The CSV appears to have no data rows. Check that the file has a header and data.")
                 st.stop()
             except Exception:
-                # Retry with latin-1
                 uploaded_file.seek(0)
                 try:
                     df = pd.read_csv(uploaded_file, sep=None, engine="python", encoding="latin-1")
@@ -96,26 +93,21 @@ def load_table(uploaded_file) -> pd.DataFrame:
                     st.error("The CSV appears to have no data rows (even after retry).")
                     st.stop()
     finally:
-        # always rewind for any subsequent reads
         uploaded_file.seek(0)
 
 def _normalize(s: str) -> str:
     return s.strip().lower().replace("-", "_").replace(" ", "_").replace("/", "_")
 
 def suggest_column_mapping(df: pd.DataFrame) -> Dict[str, Optional[str]]:
-    """Auto-suggest mapping from EXPECTED_MAP to df columns (case/space tolerant)."""
     norm_cols = {c: _normalize(c) for c in df.columns}
     mapping = {k: None for k in EXPECTED_MAP.keys()}
-
     for canon, aliases in EXPECTED_MAP.items():
-        # try canonical name
         for c, nc in norm_cols.items():
             if nc == _normalize(canon):
                 mapping[canon] = c
                 break
         if mapping[canon] is not None:
             continue
-        # try aliases
         alias_norms = [_normalize(a) for a in aliases]
         for c, nc in norm_cols.items():
             if nc in alias_norms:
@@ -124,7 +116,6 @@ def suggest_column_mapping(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     return mapping
 
 def apply_mapping(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.DataFrame:
-    """Rename mapped columns to canonical names."""
     rename_dict = {v: k for k, v in mapping.items() if v is not None and v in df.columns}
     return df.rename(columns=rename_dict)
 
@@ -132,32 +123,24 @@ def missing_required(mapping: Dict[str, Optional[str]], keys: List[str]) -> List
     return [k for k in keys if not mapping.get(k)]
 
 def agg_by_engine(df: pd.DataFrame, metric_cols: List[str], agg_fn: str) -> pd.DataFrame:
-    """Aggregate to EngineNo level using chosen agg_fn for numeric metric_cols."""
     present = [m for m in metric_cols if m in df.columns]
     if not present or df.empty:
         return df.iloc[0:0].copy()
-
-    # build aggregation map
     agg_map = {m: agg_fn for m in present}
     base_cols = [c for c in ["EngineNo", "BatchNumber", "EngineModel"] if c in df.columns]
     dfx = df[base_cols + present].copy()
-
     grouped = dfx.groupby("EngineNo", as_index=False).agg(agg_map)
-
-    # attach one label per engine for context
     meta_cols = {}
     if "BatchNumber" in dfx.columns:
         meta_cols["BatchNumber"] = lambda x: x.dropna().iloc[0] if len(x.dropna()) else np.nan
     if "EngineModel" in dfx.columns:
         meta_cols["EngineModel"] = lambda x: x.dropna().iloc[0] if len(x.dropna()) else np.nan
-
     if meta_cols:
         meta = dfx.groupby("EngineNo", as_index=False).agg(meta_cols)
         grouped = grouped.merge(meta, on="EngineNo", how="left")
     return grouped
 
 def safe_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    """Coerce specified columns to numeric; non-convertible become NaN."""
     out = df.copy()
     for c in cols:
         if c in out.columns:
@@ -168,40 +151,118 @@ def pct_apply(series: pd.Series, pct: float) -> pd.Series:
     factor = 1.0 + pct / 100.0
     return pd.to_numeric(series, errors="coerce") * factor
 
-def plot_engine_grouped_bars(df: pd.DataFrame, y_orig: str, y_sim: Optional[str],
-                             y_label: str, title: str):
-    """Grouped bar (Original vs Simulated) if y_sim present; otherwise single series.
-       Falls back to st.bar_chart when Plotly is unavailable."""
+# --------- Single-metric line (used mainly for EngineNo view summaries) ----------
+def plot_engine_lines(df: pd.DataFrame, y_orig: str, y_sim: Optional[str],
+                      y_label: str, title: str):
     if df.empty or "EngineNo" not in df.columns or y_orig not in df.columns:
         st.info("Nothing to plot for this selection.")
         return
-
     data = df.sort_values("EngineNo").copy()
-
     if PLOTLY_OK:
         if y_sim and y_sim in data.columns:
             melt = data.melt(id_vars=["EngineNo"], value_vars=[y_orig, y_sim],
                              var_name="Series", value_name="Value")
             series_map = {y_orig: "Original", y_sim: "Simulated"}
             melt["Series"] = melt["Series"].map(series_map).fillna(melt["Series"])
-            fig = px.bar(
-                melt, x="EngineNo", y="Value", color="Series", barmode="group",
-                title=title, labels={"EngineNo": "Engine No.", "Value": y_label}
-            )
+            fig = px.line(melt, x="EngineNo", y="Value", color="Series", markers=True,
+                          title=title, labels={"EngineNo": "Engine No.", "Value": y_label})
         else:
-            fig = px.bar(
-                data, x="EngineNo", y=y_orig,
-                title=title, labels={"EngineNo": "Engine No.", y_orig: y_label}
-            )
+            fig = px.line(data, x="EngineNo", y=y_orig, markers=True,
+                          title=title, labels={"EngineNo": "Engine No.", y_orig: y_label})
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.warning("Plotly is not installed; showing simplified chart.")
+        st.warning("Plotly is not installed; showing simplified line chart.")
         if y_sim and y_sim in data.columns:
             wide = data[["EngineNo", y_orig, y_sim]].set_index("EngineNo")
-            st.bar_chart(wide)
+            st.line_chart(wide)
         else:
             simple = data[["EngineNo", y_orig]].set_index("EngineNo")
-            st.bar_chart(simple)
+            st.line_chart(simple)
+
+# --------- Multi-metric overlay with optional secondary axis ----------
+def plot_overlay_lines(
+    df: pd.DataFrame,
+    primary_metrics: List[str],
+    secondary_metric: Optional[str],
+    label_map: Dict[str, str],
+    title: str,
+    compare_sim: bool,
+):
+    if df.empty or "EngineNo" not in df.columns:
+        st.info("Nothing to plot for this selection.")
+        return
+
+    data = df.sort_values("EngineNo").copy()
+    prim = [m for m in primary_metrics if m in data.columns]
+    sec = secondary_metric if (secondary_metric and secondary_metric in data.columns) else None
+
+    if not prim and not sec:
+        st.info("No selected metrics available in the current view.")
+        return
+
+    series = []
+    for m in prim:
+        series.append((m, "primary"))
+        if compare_sim and f"{m}_Sim" in data.columns:
+            series.append((f"{m}_Sim", "primary"))
+    if sec:
+        series.append((sec, "secondary"))
+        if compare_sim and f"{sec}_Sim" in data.columns:
+            series.append((f"{sec}_Sim", "secondary"))
+
+    if not series:
+        st.info("No plottable series found for the selected options.")
+        return
+
+    if PLOTLY_OK and go is not None and make_subplots is not None:
+        use_secondary = any(ax == "secondary" for _, ax in series)
+        fig = make_subplots(specs=[[{"secondary_y": use_secondary}]])
+        xvals = data["EngineNo"].astype(str).tolist()
+
+        for s_col, axis in series:
+            base = s_col.replace("_Sim", "")
+            sim_flag = " (Sim)" if s_col.endswith("_Sim") else ""
+            name = f"{label_map.get(base, base)}{sim_flag}"
+            fig.add_trace(
+                go.Scatter(x=xvals, y=data[s_col], mode="lines+markers", name=name),
+                secondary_y=(axis == "secondary"),
+            )
+
+        prim_names = [label_map.get(c.replace("_Sim",""), c.replace("_Sim","")) for c, ax in series if ax == "primary"]
+        sec_names  = [label_map.get(c.replace("_Sim",""), c.replace("_Sim","")) for c, ax in series if ax == "secondary"]
+
+        fig.update_layout(
+            title=title,
+            legend_title_text="Series",
+            hovermode="x unified",
+            margin=dict(l=10, r=10, t=50, b=10),
+        )
+        fig.update_xaxes(title_text="Engine No.")
+        fig.update_yaxes(title_text=", ".join(sorted(set(prim_names))) or "Value", secondary_y=False)
+        if use_secondary:
+            fig.update_yaxes(title_text=", ".join(sorted(set(sec_names))) or "Value", secondary_y=True)
+
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        # Fallback: normalize each series to [0,1] and overlay on a single axis
+        st.warning("Plotly is not installed; showing normalized overlay on a single axis.")
+        norm_df = pd.DataFrame({"EngineNo": data["EngineNo"].astype(str)})
+        col_names = []
+        for s_col, axis in series:
+            y = pd.to_numeric(data[s_col], errors="coerce")
+            y_min, y_max = np.nanmin(y), np.nanmax(y)
+            if np.isfinite(y_min) and np.isfinite(y_max) and y_max != y_min:
+                y_norm = (y - y_min) / (y_max - y_min)
+            else:
+                y_norm = y * 0
+            base = s_col.replace("_Sim", "")
+            sim_flag = " (Sim)" if s_col.endswith("_Sim") else ""
+            name = f"{label_map.get(base, base)}{sim_flag}"
+            norm_df[name] = y_norm
+            col_names.append(name)
+        norm_df = norm_df.set_index("EngineNo")
+        st.line_chart(norm_df[col_names])
+        st.caption("Note: normalized to [0,1] per series due to missing Plotly (no secondary axis).")
 
 # =========================
 # Sidebar (global)
@@ -228,53 +289,38 @@ with tab_perf:
     perf_file = st.file_uploader("Upload Performance file (CSV/XLSX)", type=["csv", "xlsx", "xls"], key="perf_csv")
 
     if perf_file is not None:
-        # Read table robustly
         perf_df_raw = load_table(perf_file)
-
-        # Remove fully empty columns/rows if any
-        perf_df_raw = perf_df_raw.dropna(axis=1, how="all")
-        perf_df_raw = perf_df_raw.dropna(axis=0, how="all")
-
+        perf_df_raw = perf_df_raw.dropna(axis=1, how="all").dropna(axis=0, how="all")
         if perf_df_raw.empty:
             st.error("The uploaded Performance file has no usable data after removing empty rows/columns.")
             st.stop()
 
         st.caption(f"Loaded {perf_df_raw.shape[0]} rows × {perf_df_raw.shape[1]} columns.")
 
-        # Column mapping UI
         st.markdown("#### Column Mapping")
         suggested = suggest_column_mapping(perf_df_raw)
         mapping: Dict[str, Optional[str]] = {}
         cols = ["— None —"] + list(perf_df_raw.columns)
-
         for canon in EXPECTED_MAP.keys():
             default_idx = 0
             if suggested.get(canon) in perf_df_raw.columns:
                 default_idx = cols.index(suggested[canon]) if suggested[canon] in cols else 0
-            mapping[canon] = st.selectbox(
-                f"Map **{canon}**", cols, index=default_idx, key=f"perf_map_{canon}"
-            )
+            mapping[canon] = st.selectbox(f"Map **{canon}**", cols, index=default_idx, key=f"perf_map_{canon}")
             if mapping[canon] == "— None —":
                 mapping[canon] = None
 
         perf_df = apply_mapping(perf_df_raw, mapping)
-
-        # Validate required identifiers
         req_missing = missing_required(mapping, REQUIRED_KEYS)
         if req_missing:
             st.error(f"Missing required columns: {', '.join(req_missing)}. Map them above to proceed.")
             st.stop()
 
-        # Coerce likely numeric metrics
         perf_df = safe_numeric(perf_df, [c for c, _ in PERF_METRICS])
 
-        # Filters
         st.markdown("### Filters")
-        filter_type = st.radio(
-            "Choose filter type",
-            ["Batch Number", "Engine Model", "Engine Number"],
-            horizontal=True, key="perf_filter_type",
-        )
+        filter_type = st.radio("Choose filter type",
+                               ["Batch Number", "Engine Model", "Engine Number"],
+                               horizontal=True, key="perf_filter_type")
         filtered_df = perf_df.copy()
         chosen = None
 
@@ -313,28 +359,21 @@ with tab_perf:
             "FuelFlow": "Fuel Flow % change",
         }
         sim_vals_perf = {k: 0.0 for k in sim_cols_perf}
-
         if sim_enabled:
             st.markdown("### 🔁 Simulations (Performance)")
             c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                sim_vals_perf["ActualTorque"] = st.slider(sim_cols_perf["ActualTorque"], -50.0, 50.0, 0.0, 0.5)
-            with c2:
-                sim_vals_perf["ActualPower"] = st.slider(sim_cols_perf["ActualPower"], -50.0, 50.0, 0.0, 0.5)
-            with c3:
-                sim_vals_perf["BSFC"] = st.slider(sim_cols_perf["BSFC"], -50.0, 50.0, 0.0, 0.5)
-            with c4:
-                sim_vals_perf["FuelFlow"] = st.slider(sim_cols_perf["FuelFlow"], -50.0, 50.0, 0.0, 0.5)
+            with c1: sim_vals_perf["ActualTorque"] = st.slider(sim_cols_perf["ActualTorque"], -50.0, 50.0, 0.0, 0.5)
+            with c2: sim_vals_perf["ActualPower"] = st.slider(sim_cols_perf["ActualPower"], -50.0, 50.0, 0.0, 0.5)
+            with c3: sim_vals_perf["BSFC"] = st.slider(sim_cols_perf["BSFC"], -50.0, 50.0, 0.0, 0.5)
+            with c4: sim_vals_perf["FuelFlow"] = st.slider(sim_cols_perf["FuelFlow"], -50.0, 50.0, 0.0, 0.5)
             apply_to_charts = st.checkbox("Compare Original vs Simulated in charts", value=True, key="perf_cmp")
 
-        # Build simulated DF
         sim_df = filtered_df.copy()
         if sim_enabled and not sim_df.empty:
             for metric_key in ["ActualTorque", "ActualPower", "BSFC", "FuelFlow"]:
                 if metric_key in sim_df.columns:
                     sim_df[f"{metric_key}_Sim"] = pct_apply(sim_df[metric_key], sim_vals_perf[metric_key])
 
-        # --- Charts
         st.markdown("### Analytics / Charts")
         metric_cols_present = [m for m, _ in PERF_METRICS if m in filtered_df.columns]
 
@@ -345,14 +384,39 @@ with tab_perf:
                 join_cols = ["EngineNo"] + [c for c in eng_agg_sim.columns if c.endswith("_Sim")]
                 eng_agg = eng_agg.merge(eng_agg_sim[join_cols], on="EngineNo", how="left")
 
-            cols_grid = st.columns(2)
-            for idx, (m, label) in enumerate(PERF_METRICS):
-                if m in eng_agg.columns:
-                    with cols_grid[idx % 2]:
-                        y_sim = f"{m}_Sim" if (sim_enabled and apply_to_charts and f"{m}_Sim" in eng_agg.columns) else None
-                        plot_engine_grouped_bars(eng_agg, m, y_sim, label, f"Engine No. vs {label}")
+            # === Overlay controls (Performance)
+            options_perf = [m for m, _ in PERF_METRICS if m in eng_agg.columns]
+            label_map_perf = {c: lbl for c, lbl in PERF_METRICS}
 
-            # Export aggregated
+            st.markdown("#### 📈 Overlay Chart (select multiple)")
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                prim_sel_perf = st.multiselect(
+                    "Primary-axis metrics",
+                    options=options_perf,
+                    default=[m for m in ["ActualTorque", "ActualPower"] if m in options_perf],
+                    help="Choose 1–3 metrics for the primary Y-axis",
+                )
+            with c2:
+                sec_options = ["— None —"] + options_perf
+                default_idx = sec_options.index("BSFC") if "BSFC" in options_perf else 0
+                sec_sel_perf = st.selectbox(
+                    "Secondary-axis metric (optional)",
+                    sec_options,
+                    index=default_idx if default_idx < len(sec_options) else 0,
+                    help="Good choice: BSFC on secondary axis",
+                )
+            sec_metric_perf = None if sec_sel_perf == "— None —" else sec_sel_perf
+
+            plot_overlay_lines(
+                eng_agg,
+                primary_metrics=prim_sel_perf,
+                secondary_metric=sec_metric_perf,
+                label_map=label_map_perf,
+                title="EngineNo overlays (Performance)",
+                compare_sim=(sim_enabled and apply_to_charts),
+            )
+
             st.download_button(
                 "⬇️ Download Aggregated (current view)",
                 eng_agg.to_csv(index=False).encode("utf-8"),
@@ -361,7 +425,6 @@ with tab_perf:
             )
 
         else:
-            # Engine-specific summary
             st.markdown("#### Selected Engine Summary")
             eng_df = filtered_df.copy()
             numeric_cols = eng_df.select_dtypes(include=[np.number]).columns.tolist()
@@ -370,21 +433,16 @@ with tab_perf:
                 summary.columns = ["Metric", "Mean", "Min", "Max"]
                 st.dataframe(summary, use_container_width=True)
 
-            # Means for key metrics (orig vs sim)
             label_map = {c: lbl for c, lbl in PERF_METRICS}
             means_orig = (
                 eng_df[[c for c in label_map.keys() if c in eng_df.columns]]
-                .mean(numeric_only=True)
-                .to_frame(name="Original")
-                .reset_index().rename(columns={"index": "Metric"})
+                .mean(numeric_only=True).to_frame(name="Original").reset_index().rename(columns={"index": "Metric"})
             )
             if sim_enabled:
                 sim_cols = [f"{c}_Sim" for c in label_map.keys() if f"{c}_Sim" in sim_df.columns]
                 if sim_cols:
                     means_sim = (
-                        sim_df[sim_cols]
-                        .mean(numeric_only=True)
-                        .to_frame(name="Simulated")
+                        sim_df[sim_cols].mean(numeric_only=True).to_frame(name="Simulated")
                         .reset_index().rename(columns={"index": "Metric_Sim"})
                     )
                     means_sim["Metric"] = means_sim["Metric_Sim"].str.replace("_Sim", "", regex=False)
@@ -402,20 +460,19 @@ with tab_perf:
                     value_vars=[c for c in ["Original", "Simulated"] if c in merged.columns],
                     var_name="Series", value_name="Value"
                 )
-                fig = px.bar(
+                fig = px.line(
                     melt.sort_values(["MetricLabel", "Series"]),
-                    x="MetricLabel", y="Value", color="Series", barmode="group",
+                    x="MetricLabel", y="Value", color="Series", markers=True,
                     title=f"Performance Summary — Engine {chosen}",
                     labels={"MetricLabel": "Metric", "Value": "Value"}
                 )
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.warning("Plotly is not installed; showing simplified chart.")
+                st.warning("Plotly is not installed; showing simplified line chart.")
                 simple = merged.set_index("MetricLabel")[["Original"] + (["Simulated"] if "Simulated" in merged.columns else [])]
-                st.bar_chart(simple)
+                st.line_chart(simple)
 
-            # Export filtered rows (raw vs simulated)
-            export = sim_df.copy() if sim_enabled else eng_df.copy()
+            export = (sim_df if sim_enabled else eng_df).copy()
             st.download_button(
                 "⬇️ Download Rows (selected engine; incl. simulated if enabled)",
                 export.to_csv(index=False).encode("utf-8"),
@@ -438,43 +495,34 @@ with tab_emis:
     if emis_file is not None:
         emis_df_raw = load_table(emis_file)
         emis_df_raw = emis_df_raw.dropna(axis=1, how="all").dropna(axis=0, how="all")
-
         if emis_df_raw.empty:
             st.error("The uploaded Emission file has no usable data after removing empty rows/columns.")
             st.stop()
 
         st.caption(f"Loaded {emis_df_raw.shape[0]} rows × {emis_df_raw.shape[1]} columns.")
 
-        # Column mapping (reuse Expected Map so we can filter)
         st.markdown("#### Column Mapping")
         suggested_em = suggest_column_mapping(emis_df_raw)
         mapping_em: Dict[str, Optional[str]] = {}
         cols_em = ["— None —"] + list(emis_df_raw.columns)
-
         for canon in EXPECTED_MAP.keys():
             default_idx = 0
             if suggested_em.get(canon) in emis_df_raw.columns:
                 default_idx = cols_em.index(suggested_em[canon]) if suggested_em[canon] in cols_em else 0
-            mapping_em[canon] = st.selectbox(
-                f"Map **{canon}**", cols_em, index=default_idx, key=f"emis_map_{canon}"
-            )
+            mapping_em[canon] = st.selectbox(f"Map **{canon}**", cols_em, index=default_idx, key=f"emis_map_{canon}")
             if mapping_em[canon] == "— None —":
                 mapping_em[canon] = None
 
         emis_df = apply_mapping(emis_df_raw, mapping_em)
-
         req_missing = missing_required(mapping_em, REQUIRED_KEYS)
         if req_missing:
             st.error(f"Missing required columns for filtering: {', '.join(req_missing)}. Map them above to proceed.")
             st.stop()
 
-        # Filters
         st.markdown("### Filters")
-        filter_type_e = st.radio(
-            "Choose filter type",
-            ["Batch Number", "Engine Model", "Engine Number"],
-            horizontal=True, key="emis_filter_type",
-        )
+        filter_type_e = st.radio("Choose filter type",
+                                 ["Batch Number", "Engine Model", "Engine Number"],
+                                 horizontal=True, key="emis_filter_type")
         emis_filtered = emis_df.copy()
         chosen_e = None
 
@@ -506,7 +554,6 @@ with tab_emis:
             st.success(f"Showing engine no.: {chosen_e}")
 
         st.markdown("### Analytics / Charts")
-        # Pick emission metrics to visualize (numeric, excluding identifiers)
         numeric_cols = [c for c in emis_filtered.columns if pd.api.types.is_numeric_dtype(emis_filtered[c])]
         numeric_cols = [c for c in numeric_cols if c not in ["BatchNumber", "EngineModel", "EngineNo"]]
 
@@ -520,11 +567,9 @@ with tab_emis:
                 default=numeric_cols[: min(6, len(numeric_cols))],
                 help="Examples: NOx, CO, HC, PM, Smoke, O2, CO2, Lambda, etc.",
             )
-
-            # Ensure numeric
             emis_filtered = safe_numeric(emis_filtered, chosen_metrics)
 
-            # Simulations (emissions)
+            # Simulations
             sim_vals_em: Dict[str, float] = {}
             if sim_enabled:
                 st.markdown("### 🔁 Simulations (Emissions)")
@@ -553,13 +598,38 @@ with tab_emis:
                     join_cols = ["EngineNo"] + [c for c in emis_agg_sim.columns if c.endswith("_Sim")]
                     emis_agg = emis_agg.merge(emis_agg_sim[join_cols], on="EngineNo", how="left")
 
-                cols_grid = st.columns(2)
-                for i, m in enumerate(chosen_metrics):
-                    with cols_grid[i % 2]:
-                        y_sim = f"{m}_Sim" if (sim_enabled and apply_to_charts_e and f"{m}_Sim" in emis_agg.columns) else None
-                        plot_engine_grouped_bars(emis_agg, m, y_sim, m, f"Engine No. vs {m}")
+                # === Overlay controls (Emissions)
+                options_em = [m for m in chosen_metrics if m in emis_agg.columns]
+                label_map_em = {m: m for m in options_em}
 
-                # Export aggregated
+                st.markdown("#### 📈 Overlay Chart (select multiple)")
+                c1, c2 = st.columns([2, 1])
+                with c1:
+                    prim_sel_em = st.multiselect(
+                        "Primary-axis metrics",
+                        options=options_em,
+                        default=options_em[: min(2, len(options_em))],
+                        help="Choose 1–3 metrics for the primary Y-axis",
+                    )
+                with c2:
+                    sec_options_em = ["— None —"] + options_em
+                    sec_sel_em = st.selectbox(
+                        "Secondary-axis metric (optional)",
+                        sec_options_em,
+                        index=0,
+                        help="Pick a metric with a different scale, if needed",
+                    )
+                sec_metric_em = None if sec_sel_em == "— None —" else sec_sel_em
+
+                plot_overlay_lines(
+                    emis_agg,
+                    primary_metrics=prim_sel_em,
+                    secondary_metric=sec_metric_em,
+                    label_map=label_map_em,
+                    title="EngineNo overlays (Emissions)",
+                    compare_sim=(sim_enabled and apply_to_charts_e),
+                )
+
                 st.download_button(
                     "⬇️ Download Aggregated (current view)",
                     emis_agg.to_csv(index=False).encode("utf-8"),
@@ -567,7 +637,6 @@ with tab_emis:
                     mime="text/csv",
                 )
             else:
-                # Engine-specific emission summary
                 st.markdown("#### Selected Engine — Emission Summary")
                 df_eng = emis_filtered.copy()
                 if not df_eng.empty and chosen_metrics:
@@ -576,22 +645,16 @@ with tab_emis:
                     st.dataframe(summ, use_container_width=True)
 
                     means_o = (
-                        df_eng[chosen_metrics]
-                        .mean(numeric_only=True)
-                        .to_frame(name="Original")
-                        .reset_index()
-                        .rename(columns={"index": "Metric"})
+                        df_eng[chosen_metrics].mean(numeric_only=True)
+                        .to_frame(name="Original").reset_index().rename(columns={"index": "Metric"})
                     )
 
                     if sim_enabled:
                         sims = [f"{m}_Sim" for m in chosen_metrics if f"{m}_Sim" in sim_em.columns]
                         if sims:
                             means_s = (
-                                sim_em[sims]
-                                .mean(numeric_only=True)
-                                .to_frame(name="Simulated")
-                                .reset_index()
-                                .rename(columns={"index": "Metric_Sim"})
+                                sim_em[sims].mean(numeric_only=True)
+                                .to_frame(name="Simulated").reset_index().rename(columns={"index": "Metric_Sim"})
                             )
                             means_s["Metric"] = means_s["Metric_Sim"].str.replace("_Sim", "", regex=False)
                             merged = means_o.merge(means_s[["Metric", "Simulated"]], on="Metric", how="left")
@@ -606,15 +669,15 @@ with tab_emis:
                             value_vars=[c for c in ["Original", "Simulated"] if c in merged.columns],
                             var_name="Series", value_name="Value"
                         )
-                        fig = px.bar(melt, x="Metric", y="Value", color="Series", barmode="group",
-                                     title=f"Emission Summary — Engine {chosen_e}")
+                        fig = px.line(melt, x="Metric", y="Value", color="Series", markers=True,
+                                      title=f"Emission Summary — Engine {chosen_e}")
                         st.plotly_chart(fig, use_container_width=True)
                     else:
-                        st.warning("Plotly is not installed; showing simplified chart.")
+                        st.warning("Plotly is not installed; showing simplified line chart.")
                         simple = merged.set_index("Metric")[["Original"] + (["Simulated"] if "Simulated" in merged.columns else [])]
-                        st.bar_chart(simple)
+                        st.line_chart(simple)
 
-                export_e = sim_em.copy() if sim_enabled else df_eng.copy()
+                export_e = (sim_em if sim_enabled else df_eng).copy()
                 st.download_button(
                     "⬇️ Download Rows (selected engine; incl. simulated if enabled)",
                     export_e.to_csv(index=False).encode("utf-8"),
@@ -630,5 +693,6 @@ with tab_emis:
 # Footer
 st.caption(
     "Batch/Model views aggregate multiple records per engine using the selected aggregation. "
-    "Simulations apply percentage changes to selected metrics and are shown alongside originals."
+    "Simulations apply percentage changes to selected metrics and are shown alongside originals. "
+    "Overlay charts support a secondary Y-axis for mixed-scale metrics."
 )
